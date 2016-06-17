@@ -75,7 +75,6 @@ FAILURE = 'FAILURE'
 SUCCESS = 'SUCCESS'
 PLATFORM_ACTUATOR = 'platform.actuator'
 TEST_AGENT = 'test-agent'
-actuator_uuid = None
 REQUEST_CANCEL_SCHEDULE = 'request_cancel_schedule'
 REQUEST_NEW_SCHEDULE = 'request_new_schedule'
 publish_agent_v2 = None
@@ -159,8 +158,7 @@ def publish_agent(request, volttron_instance):
     Fixture used for setting up the environment.
     1. Creates fake driver configs
     2. Starts the master driver agent with the created fake driver agents
-    3. Starts the actuator agent
-    4. Creates an instance Agent class for publishing and returns it
+    3. Creates an instance Agent class for publishing and returns it
 
     :param request: pytest request object
     :param volttron_instance: instance of volttron in which test cases
@@ -181,21 +179,16 @@ def publish_agent(request, volttron_instance):
 
     # Start the master driver agent which would intern start the fake driver
     # using the configs created above
+    driver_config = utils.load_config("scripts/scalability-testing/configs/master-driver.agent")
+    driver_config["schedule_publish_interval"] = 2
+    driver_config["schedule_state_file"] = "actuator_state.test"
+
     master_uuid = volttron_instance.install_agent(
         agent_dir="services/core/MasterDriverAgent",
-        config_file="scripts/scalability-testing/configs/master-driver.agent",
+        config_file=driver_config,
         start=True)
     print("agent id: ", master_uuid)
     gevent.sleep(2)  # wait for the agent to start and start the devices
-
-    # Start the actuator agent through which publish agent should communicate
-    # to fake device. Start the master driver agent which would intern start
-    # the fake driver using the configs created above
-    actuator_uuid = volttron_instance.install_agent(
-        agent_dir="services/core/ActuatorAgent",
-        config_file="services/core/ActuatorAgent/tests/actuator.config",
-        start=True)
-    print("agent id: ", actuator_uuid)
 
     listener_uuid = volttron_instance.install_agent(
         agent_dir="examples/ListenerAgent",
@@ -226,7 +219,6 @@ def publish_agent(request, volttron_instance):
     # and the fake agent that published to message bus
     def stop_agent():
         print("In teardown method of module")
-        volttron_instance.stop_agent(actuator_uuid)
         volttron_instance.stop_agent(master_uuid)
         fake_publish_agent.core.stop()
 
@@ -330,26 +322,20 @@ def test_schedule_response(publish_agent):
 
 
 @pytest.mark.actuator_pubsub
-def test_schedule_announce(publish_agent, volttron_instance):
+def test_schedule_announce(publish_agent):
     """ Tests the schedule announcements of actuator.
 
     Waits for two announcements and checks if the right parameters
     are sent to call back method.
     :param publish_agent: fixture invoked to setup all agents necessary and
     returns an instance of Agent object used for publishing
-    :param volttron_instance: Volttron instance on which test is run
     """
     print ("\n**** test_schedule_announce ****")
     global actuator_uuid, publish_agent_v2
 
     if publish_agent_v2 is not None:
         pytest.skip('No difference between 2.0 and 3.0 agent. Skip for 2.0')
-    # Use a actuator that publishes frequently
-    volttron_instance.stop_agent(actuator_uuid)
-    actuator_uuid = volttron_instance.install_agent(
-        agent_dir="services/core/ActuatorAgent",
-        config_file="services/core/ActuatorAgent/tests/actuator2.config",
-        start=True)
+
     try:
         # reset mock to ignore any previous callback
         publish_agent.callback.reset_mock()
@@ -414,13 +400,8 @@ def test_schedule_announce(publish_agent, volttron_instance):
             'platform.actuator',
             REQUEST_CANCEL_SCHEDULE,
             TEST_AGENT,
-            'task_schedule_announce').get(timeout=10)
-        volttron_instance.stop_agent(actuator_uuid)
-        print ("creating instance of actuator with larger publish frequency")
-        actuator_uuid = volttron_instance.install_agent(
-            agent_dir="services/core/ActuatorAgent",
-            config_file="services/core/ActuatorAgent/tests/actuator.config",
-            start=True)
+            'task_schedule_announce').get()
+        gevent.sleep(1)
 
 
 @pytest.mark.actuator_pubsub
@@ -1621,9 +1602,9 @@ def test_get_error_invalid_point(publish_agent):
     result_header = publish_agent.callback.call_args[0][4]
     result_message = publish_agent.callback.call_args[0][5]
     assert result_message['type'] == \
-           'master_driver.interfaces.DriverInterfaceError'
+           'DriverInterfaceError'
     assert result_message['value'] == \
-           "['Point not configured on device: SampleWritableFloat12']"
+           'Point not configured on device: SampleWritableFloat12'
     assert result_header['requesterID'] == TEST_AGENT
 
 
@@ -1784,7 +1765,7 @@ def test_set_value_array(publish_agent, cancel_schedules, revert_devices):
     assert result_header['requesterID'] == agentid
     assert result_message['type'] == 'TypeError'
     assert result_message['value'] == \
-           "['float() argument must be a string or a number']"
+           'float() argument must be a string or a number'
 
 
 @pytest.mark.actuator_pubsub
@@ -2199,9 +2180,7 @@ def test_set_read_only_point(publish_agent, cancel_schedules):
     assert result_header['requesterID'] == agentid
     result_message = publish_agent.callback.call_args[0][5]
     assert result_message['type'] == 'IOError'
-    assert result_message['value'] == "['Trying to write to a point " \
-                                      "configured read only: " \
-                                      "OutsideAirTemperature1']"
+    assert result_message['value'] == 'Trying to write to a point configured read only: OutsideAirTemperature1'
 
 
 @pytest.mark.actuator_pubsub
@@ -2367,7 +2346,7 @@ def test_set_value_error(publish_agent, cancel_schedules):
     assert result_header['requesterID'] == agentid
     assert result_message['type'] == 'ValueError'
     assert result_message['value'] == \
-           "['could not convert string to float: abcd']"
+           'could not convert string to float: abcd'
 
 
 @pytest.mark.actuator_pubsub

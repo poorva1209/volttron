@@ -380,7 +380,8 @@ class MasterDriverAgent(Agent):
                                         point, headers, value)
         except RemoteError as ex:
             self._handle_remote_error(ex, point, headers)
-        except StandardError as ex:
+        except (StandardError, Exception) as ex:
+            # DriverInterfaceError is an exception
             self._handle_standard_error(ex, point, headers)
 
     def handle_set(self, peer, sender, bus, topic, headers, message):
