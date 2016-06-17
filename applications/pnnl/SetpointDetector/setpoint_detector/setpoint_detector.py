@@ -5,27 +5,32 @@ from datetime import timedelta as td, datetime as dt
 from copy import deepcopy
 from dateutil .parser import parse
 import os
+import imp
 
 import numpy as np
 from scipy.stats import norm
-from scipy.signal import butter, filtfilt, argrelextrema
-import matplotlib.pyplot as plt
-from matplotlib.pyplot import plot, scatter, show, figure, title, axes, autoscale
-import matplotlib.patches as patches
-import matplotlib.transforms as transforms
+from scipy.signal import butter, filtfilt
+try:
+    imp.find_module('matplotlib')
+    import matplotlib.pyplot as plt
+    from matplotlib.pyplot import plot, scatter, show, figure, title, axes, autoscale
+    import matplotlib.patches as patches
+    import matplotlib.transforms as transforms
+    debug_tools = True
+except ImportError:
+    debug_tools = False
 
 from volttron.platform.messaging import topics
 from volttron.platform.agent import utils
 from volttron.platform.agent.utils import jsonapi, setup_logging
 from volttron.platform.vip.agent import Agent, Core
-from volttron.platform.jsonrpc import RemoteError
-from matplotlib.backends.backend_pdf import PdfPages
+
 import gevent
 
 cutoff = 1500
 fs = 50000
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __author1__ = 'Woohyun Kim <woohyun.kim@pnnl.gov>'
 __author2__ = 'Robert Lutes <robert.lutes@pnnl.gov>'
@@ -211,235 +216,226 @@ def detect_peaks(data, mph=None, threshold=0, mpd=1, edge='rising',
         ind = np.sort(ind[~idel])
     return ind
 
+    
+def calculate_overlapping_area(m1, std1, m2, std2, intersections):
+    lower = min(norm.cdf(min(intersections), m1, std1), norm.cdf(min(intersections), m2, std2))
+    mid_calc1 = 1 - norm.cdf(min(intersections), m1, std1) - (1-norm.cdf(max(intersections), m1, std1))
+    mid_calc2 = 1 - norm.cdf(min(intersections), m2, std2) - (1 - norm.cdf(max(intersections), m2, std2))
+    mid = min(mid_calc1, mid_calc2)
+    end = min(1 - norm.cdf(max(intersections), m1, std1), 1 - norm.cdf(max(intersections), m2, std2))
+    return lower + mid + end
+
+    
+utils.setup_logging()
+_log = logging.getLogger(__name__)
 
 def setpoint_detector(config_path, **kwargs):
-    '''detect zone temperature set point.'''
-    config = utils.load_config(config_path)
-    # agent_id = config.get('agent_id')
-    utils.setup_logging()
-    _log = logging.getLogger(__name__)
+    config= utils.load_config(config_path)
+    return SetPointDetector(config, **kwargs)
 
-    logging.basicConfig(level=logging.debug,
-                        format='%(asctime)s   %(levelname)-8s %(message)s',
-                        datefmt='%m-%d-%y %H:%M:%S')
+class SetPointDetector(Agent):
+    def __init__(self, config, **kwargs):
+        super(SetPointDetector, self).__init__(**kwargs)
+        self.minimum_data_count = config.get('minimum_data_count', 5)
+        self.area_distribution_threshold = config.get('area_distribution_threshold', 0.1)
+        self.debug = config.get('debug_flag', False)
+        self.debug_directory = config.get('debug_directory')
+        self.device_topic = topics.DEVICES_VALUE(campus=config.get('campus', ''),
+                                    building=config.get('building', ''),
+                                    unit=config.get('unit', ''),
+                                    path='',
+                                    point='all')
 
-    device_topic = topics.DEVICES_VALUE(campus=config.get('campus', ''),
-                                        building=config.get('building', ''),
-                                        unit=config.get('unit', ''),
-                                        path='',
-                                        point='all')
-    
-    fanstatus_name = config.get('FanStatus', 'FanStatus')
-    zonetemp = config.get('ZoneTemperature', 'zonetemp')
-    
-    need = [fanstatus_name, zonetemp]
+        self.fanstatus_name = config.get('FanStatus', 'FanStatus')
+        self.zonetemp = config.get('ZoneTemperature', 'zonetemp')
 
-    class SetPointDetector(Agent):
-        def __init__(self, **kwargs):
-            super(SetPointDetector, self).__init__(**kwargs)
-            self.minimum_data_count = config.get('minimum_data_count', 5)
-            self.area_distribution_threshold = config.get('area_distribution_threshold', 0.1)
-            self.debug = config.get('debug_flag', False)
-            self.debug_directory = config.get('debug_directory')
-            self.initialize()
+        self.need = [self.fanstatus_name, self.zonetemp]
+        self.initialize()
 
-        def initialize(self):
-            self.zonetemp_array = np.empty(0)
-            self.fan_status_arr = np.empty(0)
-            self.timestamp_array = np.empty(0)
-            self.inconsistent_data_flag = 0
-            self.number = 0
-            self.startup = True
-            self.available = []
+    def initialize(self):
+        self.zonetemp_array = np.empty(0)
+        self.fan_status_arr = np.empty(0)
+        self.timestamp_array = np.empty(0)
+        self.inconsistent_data_flag = 0
+        self.number = 0
+        self.startup = True
+        self.available = []
 
-        @Core.receiver('onstart')
-        def starting_base(self, sender, **kwargs):
-            self.vip.pubsub.subscribe(peer='pubsub',
-                                      prefix=device_topic,
-                                      callback=self.on_new_data)
+    @Core.receiver('onstart')
+    def starting_base(self, sender, **kwargs):
+        self.vip.pubsub.subscribe(peer='pubsub',
+                                  prefix=self.device_topic,
+                                  callback=self.on_new_data)
 
-        def check_data_requirements(self, available):
-            """Minimum data requirement is zone temperature and supply fan status.
-            """
-            avail_need = [item for item in need if item in available]
+    def check_data_requirements(self, available):
+        """Minimum data requirement is zone temperature and supply fan status.
+        """
+        avail_need = [item for item in self.need if item in available]
 
-            if zonetemp in avail_need and fanstatus_name in avail_need:
-                self.available = available
-                return True
-            return False
+        if self.zonetemp in avail_need and self.fanstatus_name in avail_need:
+            self.available = available
+            return True
+        return False
 
-        def on_new_data(self, peer, sender, bus, topic, headers, message):
-            '''Subscribe to device data on the message bus.'''
-            _log.info('RECEIVING NEW DATA')
-            data = message[0]
-            available = data.keys()
+    def on_new_data(self, peer, sender, bus, topic, headers, message):
+        '''Subscribe to device data on the message bus.'''
+        _log.debug('RECEIVING NEW DATA')
+        data = message[0]
+        available = data.keys()
+        if self.startup:
             if not self.check_data_requirements(available):
-                _log.info('Required data for diagnostic is not available or '
+                _log.warn('Required data for diagnostic is not available or '
                           'configured names do not match published names!')
                 return
-            self.startup = False
-            for item in self.available:
-                if item not in available:
-                    self.inconsistent_data_flag += 1
-                    _log.info('Previously available data is missing '
-                              'from device publish')
-                    if self.inconsistent_data_flag > 5:
-                        _log.info('data fields available for device are '
-                                  'not consistent. Reinitializing diagnostic.')
-                        self.initialize()
-                    return
-            self.inconsistent_data_flag = 0
-            timestamp = parse(headers['Date'])
-            fanstat_value = int(data[fanstatus_name])
-            if not fanstat_value:
-                _log.info('Supply fan is off.  Data for {} '
-                           'will not used'.format(str(timestamp)))
-                return
-            _log.info('Checking timeseries data {}'.format(timestamp))
-            zonetemp_val = float(data.get(zonetemp))
-            self.detect_stpt_main(zonetemp_val, timestamp)
-            return
-
-        def check_run_status(self, current_time):
-            if self.timestamp_array.size and self.timestamp_array[0].date() != current_time.date():
-                return True
-            return False
-
-        def detect_stpt_main(self, zone_temp, current_time):
-            try:
-                if self.check_run_status(current_time):
-                    valleys, peaks, filtered_timeseries = locate_min_max(self.zonetemp_array)
-                    if np.prod(peaks.shape) < self.minimum_data_count or np.prod(valleys.shape) < self.minimum_data_count:
-                        _log.debug('Set point detection is inconclusive.  Not enough data.')
-                        self.initialize()
-                        return
-                    peak_array, valley_array = align_pv(filtered_timeseries, peaks, valleys, self.timestamp_array)
-                    if (np.prod(peak_array.shape) < self.minimum_data_count or
-                          np.prod(valley_array.shape) < self.minimum_data_count):
-                        _log.debug('Set point detection is inconclusive.  Not enough data.')
-                        self.initialize()
-                        return
-                    self.current_stpt_array, self.current_timestamp_array = self.create_setpoint_array(deepcopy(peak_array), deepcopy(valley_array))
-                    # do domething with this
-                    setpoint_array = self.check_timeseries_grouping()
+        self.startup = False
+        for item in self.available:
+            if item not in available:
+                self.inconsistent_data_flag += 1
+                _log.debug('Previously available data is missing '
+                          'from device publish')
+                if self.inconsistent_data_flag > 5:
+                    _log.debug('data fields available for device are '
+                              'not consistent. Reinitializing diagnostic.')
                     self.initialize()
-            finally:
-                self.timestamp_array = np.append(self.timestamp_array, current_time)
-                self.zonetemp_array = np.append(self.zonetemp_array, zone_temp)
+                return
+        self.inconsistent_data_flag = 0
+        timestamp = parse(headers['Date'])
+        fanstat_value = int(data[self.fanstatus_name])
+        if not fanstat_value:
+            _log.debug('Supply fan is off.  Data for {} '
+                       'will not used'.format(str(timestamp)))
+            return
+        _log.debug('Checking timeseries data {}'.format(timestamp))
+        zonetemp_val = float(data.get(self.zonetemp))
+        self.detect_stpt_main(zonetemp_val, timestamp)
+        return
 
-        def check_timeseries_grouping(self):
-            incrementer = 0
-            index = 0
-            set_points = []
-            number_groups = int(ceil(self.current_stpt_array.size)) - self.minimum_data_count  if self.current_stpt_array.size > self.minimum_data_count else 1
-            if number_groups == 1:
-                current_stpt = [self.timestamp_array[0], self.timestamp_array[-1], np.average(self.current_stpt_array)]
-                set_points.append(current_stpt)
-            else:
-                for grouper in range(number_groups):
-                    current = self.current_stpt_array[(0+incrementer):(self.minimum_data_count+incrementer+index)]
-                    next_group = self.current_stpt_array[(1+grouper):(self.minimum_data_count+grouper+1)]
-                    _log.info('Current {}'.format(current))
-                    _log.info('Current {}'.format(next_group))
-                    area = self.determine_distribution_area(current, next_group)
-                    _log.info('distribution area {}'.format(area))
-                    if area < self.area_distribution_threshold:
-                        incrementer += 1
+    def check_run_status(self, current_time):
+        if self.timestamp_array.size and self.timestamp_array[0].date() != current_time.date():
+            return True
+        return False
+
+    def detect_stpt_main(self, zone_temp, current_time):
+        try:
+            if self.check_run_status(current_time):
+                valleys, peaks, filtered_timeseries = locate_min_max(self.zonetemp_array)
+                if np.prod(peaks.shape) < self.minimum_data_count or np.prod(valleys.shape) < self.minimum_data_count:
+                    _log.debug('Set point detection is inconclusive.  Not enough data.')
+                    self.initialize()
+                    return
+                peak_array, valley_array = align_pv(filtered_timeseries, peaks, valleys, self.timestamp_array)
+                if (np.prod(peak_array.shape) < self.minimum_data_count or
+                      np.prod(valley_array.shape) < self.minimum_data_count):
+                    _log.debug('Set point detection is inconclusive.  Not enough data.')
+                    self.initialize()
+                    return
+                self.current_stpt_array, self.current_timestamp_array = self.create_setpoint_array(deepcopy(peak_array), deepcopy(valley_array))
+                # do domething with this
+                setpoint_array = self.check_timeseries_grouping()
+                self.initialize()
+        finally:
+            self.timestamp_array = np.append(self.timestamp_array, current_time)
+            self.zonetemp_array = np.append(self.zonetemp_array, zone_temp)
+
+    def check_timeseries_grouping(self):
+        incrementer = 0
+        index = 0
+        set_points = []
+        number_groups = int(ceil(self.current_stpt_array.size)) - self.minimum_data_count  if self.current_stpt_array.size > self.minimum_data_count else 1
+        if number_groups == 1:
+            current_stpt = [self.timestamp_array[0], self.timestamp_array[-1], np.average(self.current_stpt_array)]
+            set_points.append(current_stpt)
+        else:
+            for grouper in range(number_groups):
+                current = self.current_stpt_array[(0+incrementer):(self.minimum_data_count+incrementer+index)]
+                next_group = self.current_stpt_array[(1+grouper):(self.minimum_data_count+grouper+1)]
+                _log.debug('Current {}'.format(current))
+                _log.debug('Current {}'.format(next_group))
+                area = self.determine_distribution_area(current, next_group)
+                _log.debug('distribution area {}'.format(area))
+                if area < self.area_distribution_threshold:
+                    incrementer += 1
+                    current_stpt = [self.timestamp_array[0+incrementer],
+                                    self.timestamp_array[self.minimum_data_count+incrementer+index],
+                                    np.average(current)]
+                    set_points.append(current_stpt)
+                    if grouper < number_groups- 1:
+                        last_stpt = [self.timestamp_array[1+grouper],
+                                     self.timestamp_array[self.minimum_data_count+grouper+1],
+                                     np.average(next_group)]
+                        set_points.append(last_stpt)
+                else:
+                    index += 1
+                    if grouper == number_groups - 1:
+                        current = self.current_stpt_array[(0+incrementer):(self.minimum_data_count+grouper+1)]
                         current_stpt = [self.timestamp_array[0+incrementer],
-                                        self.timestamp_array[self.minimum_data_count+incrementer+index],
-                                        np.average(current)]
+                                    self.timestamp_array[self.minimum_data_count+grouper+1],
+                                    np.average(current)]
                         set_points.append(current_stpt)
-                        if grouper < number_groups- 1:
-                            last_stpt = [self.timestamp_array[1+grouper],
-                                         self.timestamp_array[self.minimum_data_count+grouper+1],
-                                         np.average(next_group)]
-                            set_points.append(last_stpt)
-                    else:
-                        index += 1
-                        if grouper == number_groups - 1:
-                            current = self.current_stpt_array[(0+incrementer):(self.minimum_data_count+grouper+1)]
-                            current_stpt = [self.timestamp_array[0+incrementer],
-                                        self.timestamp_array[self.minimum_data_count+grouper+1],
-                                        np.average(current)]
-                            set_points.append(current_stpt)
-            _log.debug('SETPOINT ARRAY: {}'.format(set_points))
-            if self.debug:
-                plt.close()
-            return set_points
-        
-        def determine_distribution_area(self, current_ts, next_ts):
-
-            def calculate_area():
-                lower = min(norm.cdf(min(intersections), m1, std1), norm.cdf(min(intersections), m2, std2))
-                mid_calc1 = 1 - norm.cdf(min(intersections), m1, std1) - (1-norm.cdf(max(intersections), m1, std1))
-
-                mid_calc2 = 1 - norm.cdf(min(intersections), m2, std2) - (1 - norm.cdf(max(intersections), m2, std2))
-                mid = min(mid_calc1, mid_calc2)
-                end = min(1 - norm.cdf(max(intersections), m1, std1), 1 - norm.cdf(max(intersections), m2, std2))
-                return lower + mid + end
-
-            if np.average(current_ts) > np.average(next_ts):
-                current_max = True
-                m1 = np.average(current_ts)
-                m2 = np.average(next_ts)
-                std1 = np.std(current_ts)
-                std2 = np.std(next_ts)
-            else:
-                current_max = False
-                m2 = np.average(current_ts)
-                m1 = np.average(next_ts)
-                std2 = np.std(current_ts)
-                std1 = np.std(next_ts)
-            intersections = find_intersections(m1, m2, std1, std2)
-            area = calculate_area()
-            if self.debug and self.debug_directory is not None:
-                self.plot_dist_area(m1, std1, m2, std2, self.timestamp_array[0].date(), area, current_max)
-            return area
-
-        def create_setpoint_array(self, pcopy, vcopy):
-            peak_ts = zip(self.timestamp_array[pcopy], self.zonetemp_array[pcopy])
-            valley_ts = zip(self.timestamp_array[vcopy], self.zonetemp_array[vcopy])
-            remove_temp1 = [(x[0], x[1]) for x, y in zip(peak_ts, valley_ts) if x[1] >= y[1] + 0.2]
-            remove_temp2 = [(y[0], y[1]) for x, y in zip(peak_ts, valley_ts) if x[1] >= y[1] + 0.2]
-
-            peak_temp = [row[1] for row in remove_temp1]
-            valley_temp = [row[1] for row in remove_temp2]
-            
-            peak_timestamp = [row[0] for row in remove_temp1]
-            valley_timestamp = [row[0] for row in remove_temp2]
-            if peak_timestamp[0] < valley_timestamp[0]:
-                timestamp_array = np.array(peak_timestamp) + (np.array(valley_timestamp) - np.array(peak_timestamp))/2
-            else:
-                timestamp_array = np.array(valley_timestamp) + (np.array(peak_timestamp) - np.array(valley_timestamp))/2 
-            return (np.array(peak_temp) + np.array(valley_temp)) / 2, timestamp_array
-
-        def plot_dist_area(self, m1, std1, m2, std2, _date, area, current_max):
-            directory = self.debug_directory + '{}'.format(_date)
-            if not os.path.exists(directory):
-                 os.makedirs(directory)
-            self.number += 1
-            fig = plt.figure()
-            fig.text(0, 0,'area: {}    std1: {}    std2: {}    current_max: {}'.format(area, std1, std2, current_max))
-            x = np.linspace(60.0,80.-0,1000)
-            plt.plot(x,norm.pdf(x, m1, std1))
-            plt.plot(x,norm.pdf(x, m2, std2))
-            mover = (m2,m1) if m1 > m2 else (m1,m2)
-
-            axes = plt.gca()
-            #axes.set_ylim([0,0.5])
-            axes.set_xlim([mover[0]-8, mover[1]+8])
-
-            plt.ylabel('Probability', fontsize=14, fontweight='bold')
-            plt.xlabel('Temperature[F]', fontsize=14, fontweight='bold')
-            file_name = directory + '/distribution_curve{}'.format(self.number)
-            plt.savefig(file_name)
+        _log.debug('SETPOINT ARRAY: {}'.format(set_points))
+        if self.debug:
             plt.close()
-                
-    return SetPointDetector(**kwargs)
+        return set_points
+    
+    def determine_distribution_area(self, current_ts, next_ts):
+        if np.average(current_ts) > np.average(next_ts):
+            current_max = True
+            m1 = np.average(current_ts)
+            m2 = np.average(next_ts)
+            std1 = np.std(current_ts)
+            std2 = np.std(next_ts)
+        else:
+            current_max = False
+            m2 = np.average(current_ts)
+            m1 = np.average(next_ts)
+            std2 = np.std(current_ts)
+            std1 = np.std(next_ts)
+        intersections = find_intersections(m1, m2, std1, std2)
+        area = calculate_overlapping_area(m1, std1, m2, std2, intersections)
+        if self.debug and self.debug_directory is not None:
+            self.plot_dist_area(m1, std1, m2, std2, self.timestamp_array[0].date(), area, current_max)
+        return area
+
+    def create_setpoint_array(self, pcopy, vcopy):
+        peak_ts = zip(self.timestamp_array[pcopy], self.zonetemp_array[pcopy])
+        valley_ts = zip(self.timestamp_array[vcopy], self.zonetemp_array[vcopy])
+        remove_temp1 = [(x[0], x[1]) for x, y in zip(peak_ts, valley_ts) if x[1] >= y[1] + 0.2]
+        remove_temp2 = [(y[0], y[1]) for x, y in zip(peak_ts, valley_ts) if x[1] >= y[1] + 0.2]
+
+        peak_temp = [row[1] for row in remove_temp1]
+        valley_temp = [row[1] for row in remove_temp2]
+        
+        peak_timestamp = [row[0] for row in remove_temp1]
+        valley_timestamp = [row[0] for row in remove_temp2]
+        if peak_timestamp[0] < valley_timestamp[0]:
+            timestamp_array = np.array(peak_timestamp) + (np.array(valley_timestamp) - np.array(peak_timestamp))/2
+        else:
+            timestamp_array = np.array(valley_timestamp) + (np.array(peak_timestamp) - np.array(valley_timestamp))/2 
+        return (np.array(peak_temp) + np.array(valley_temp)) / 2, timestamp_array
+
+    def plot_dist_area(self, m1, std1, m2, std2, _date, area, current_max):
+        directory = self.debug_directory + '{}'.format(_date)
+        if not os.path.exists(directory):
+             os.makedirs(directory)
+        self.number += 1
+        fig = plt.figure()
+        fig.text(0, 0,'area: {}    std1: {}    std2: {}    current_max: {}'.format(area, std1, std2, current_max))
+        x = np.linspace(60.0,80.-0,1000)
+        plt.plot(x,norm.pdf(x, m1, std1))
+        plt.plot(x,norm.pdf(x, m2, std2))
+        mover = (m2,m1) if m1 > m2 else (m1,m2)
+        axes = plt.gca()
+        axes.set_xlim([mover[0]-8, mover[1]+8])
+
+        plt.ylabel('Probability', fontsize=14, fontweight='bold')
+        plt.xlabel('Temperature[F]', fontsize=14, fontweight='bold')
+        file_name = directory + '/distribution_curve{}'.format(self.number)
+        plt.savefig(file_name)
+        plt.close()
 
 
 def main(argv=sys.argv):
-    '''Main method called to start the agent.'''
+    """Main method called by the platform."""
     utils.vip_main(setpoint_detector)
 
 
@@ -448,4 +444,4 @@ if __name__ == '__main__':
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        pass     
+        pass
