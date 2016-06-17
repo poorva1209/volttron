@@ -1,5 +1,8 @@
 {
     "agentid": "master_driver",
+    "schedule_publish_interval": 30,
+    "heartbeat_toggle_interval": 20,
+    "schedule_state_file": "actuator_state.pickle"
     "driver_config_list": [
     					   "/home/volttron/volttron/examples/configurations/drivers/fake.config"
     					  ]

@@ -111,15 +111,6 @@ def publish_agent(request, volttron_instance):
     print("agent id: ", master_uuid)
     gevent.sleep(2)  # wait for the agent to start and start the devices
 
-    # Start the actuator agent through which publish agent should communicate
-    # to fake device. Start the master driver agent which would intern start
-    # the fake driver using the configs created above
-    actuator_uuid = volttron_instance.install_agent(
-        agent_dir="services/core/ActuatorAgent",
-        config_file="services/core/ActuatorAgent/tests/actuator.config",
-        start=True)
-    print("agent id: ", actuator_uuid)
-
     # 3: Start a fake agent to publish to message bus
     publish_agent = volttron_instance.build_agent()
 
@@ -127,7 +118,6 @@ def publish_agent(request, volttron_instance):
     #  \that published to message bus
     def stop_agent():
         print("In teardown method of module")
-        volttron_instance.stop_agent(actuator_uuid)
         volttron_instance.stop_agent(master_uuid)
         publish_agent.core.stop()
 
@@ -897,9 +887,8 @@ def test_schedule_premept_active_task_gracetime(publish_agent,
         ).get(timeout=10)
         pytest.fail('Expecting LockError. Code returned: {}'.format(result))
     except RemoteError as e:
-        assert e.exc_info['exc_type'] == 'actuator.agent.LockError'
-        assert e.message == 'caller ({}) does not have this lock'.format(
-            agentid)
+        assert e.exc_info['exc_type'] == 'master_driver.agent.LockError'
+        assert e.message == 'caller ({}) does not have this lock'.format(agentid)
 
 
 @pytest.mark.actuator
@@ -1587,8 +1576,7 @@ def test_set_error_array(publish_agent, cancel_schedules):
         pytest.fail('Expecting RemoteError for trying to set array on point '
                     'that expects float. Code returned {}'.format(result))
     except RemoteError as e:
-        assert e.message == \
-               "TypeError('float() argument must be a string or a number')"
+        assert e.message == 'float() argument must be a string or a number'
 
 
 @pytest.mark.actuator
@@ -1613,7 +1601,7 @@ def test_set_lock_error(publish_agent):
         ).get(timeout=10)
         pytest.fail('Expecting LockError. Code returned: {}'.format(result))
     except RemoteError as e:
-        assert e.exc_info['exc_type'] == 'actuator.agent.LockError'
+        assert e.exc_info['exc_type'] == 'master_driver.agent.LockError'
         assert e.message == 'caller ({}) does not have this lock'.format(
             TEST_AGENT)
 
@@ -1660,8 +1648,7 @@ def test_set_value_error(publish_agent, cancel_schedules):
         pytest.fail(
             "Expecting ValueError but code returned: {}".format(result))
     except RemoteError as e:
-        assert e.message == "ValueError('could not convert string to float: " \
-                            "On')"
+        assert e.message == 'could not convert string to float: On'
 
 
 @pytest.mark.actuator
@@ -1755,5 +1742,4 @@ def test_set_error_read_only_point(publish_agent, cancel_schedules):
         pytest.fail(
             'Expecting RemoteError but code returned: {}'.format(result))
     except RemoteError as e:
-        assert e.message == "IOError('Trying to write to a point configured " \
-                            "read only: OutsideAirTemperature1')"
+        assert e.message == 'Trying to write to a point configured read only: OutsideAirTemperature1'
