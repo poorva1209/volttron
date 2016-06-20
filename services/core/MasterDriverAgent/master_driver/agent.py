@@ -135,7 +135,6 @@ def master_driver_agent(config_path, **kwargs):
         _log.warn("No limit set on the maximum number of concurrently open sockets. "
                   "Consider setting max_open_sockets if you plan to work with 800+ modbus devices.")
 
-
     #TODO: update the default after scalability testing.
     max_concurrent_publishes = config.get('max_concurrent_publishes', 10000)
     if max_concurrent_publishes < 1:
@@ -291,6 +290,15 @@ class MasterDriverAgent(Agent):
                 _log.info("Std dev publish time: "+str(stdev))
                 sys.exit(0)
 
+    def _check_lock(self, device, requester):
+        _log.debug('_check_lock: {device}, {requester}'.format(device=device,
+                                                              requester=requester))
+        device = device.strip('/')
+        if device in self._device_states:
+            device_state = self._device_states[device]
+            return device_state.agent_id == requester
+        return False
+
     def _update_device_state_and_schedule(self, now):
         _log.debug("_update_device_state_and_schedule")
         # Sanity check now.
@@ -346,6 +354,32 @@ class MasterDriverAgent(Agent):
         self._push_result_topic_pair(ERROR_RESPONSE_PREFIX,
                                     point, headers, error)
         _log.debug('Actuator Agent Error: ' + str(error))
+
+    def _handle_unknown_schedule_error(self, ex, headers, message):
+        _log.error(
+            'bad request: {header}, {request}, {error}'.format(header=headers, request=message, error=str(ex)))
+        results = {'result': "FAILURE",
+                   'data': {},
+                   'info': 'MALFORMED_REQUEST: ' + ex.__class__.__name__ + ': ' + str(ex)}
+        self.vip.pubsub.publish('pubsub', topics.ACTUATOR_SCHEDULE_RESULT(), headers=headers, message=results)
+        return results
+
+    def _get_headers(self, requester, time=None, task_id=None):
+        headers = {}
+        if time is not None:
+            headers['time'] = time
+        else:
+            utcnow = datetime.utcnow()
+            headers = {'time': utils.format_timestamp(utcnow)}
+        if requester is not None:
+            headers['requesterID'] = requester
+        if task_id is not None:
+            headers['taskID'] = task_id
+        return headers
+
+    def _push_result_topic_pair(self, prefix, point, headers, value):
+        topic = normtopic('/'.join([prefix, point]))
+        self.vip.pubsub.publish('pubsub', topic, headers, message=value)
 
     def handle_get(self, peer, sender, bus, topic, headers, message):
         """
@@ -513,6 +547,79 @@ class MasterDriverAgent(Agent):
         except StandardError as ex:
             self._handle_standard_error(ex, point, headers)
 
+    def handle_schedule_request(self, peer, sender, bus, topic, headers, message):
+        """
+        Schedule request pub/sub handler
+
+        An agent can request a task schedule by publishing to the
+        ``devices/actuators/schedule/request`` topic with the following header:
+
+        .. code-block:: python
+
+            {
+                'type': 'NEW_SCHEDULE',
+                'requesterID': <Agent ID>, #The name of the requesting agent.
+                'taskID': <unique task ID>, #The desired task ID for this task. It must be unique among all other scheduled tasks.
+                'priority': <task priority>, #The desired task priority, must be 'HIGH', 'LOW', or 'LOW_PREEMPT'
+            }
+
+        The message must describe the blocks of time using the format described in `Device Schedule`_.
+
+        A task may be canceled by publishing to the
+        ``devices/actuators/schedule/request`` topic with the following header:
+
+        .. code-block:: python
+
+            {
+                'type': 'CANCEL_SCHEDULE',
+                'requesterID': <Agent ID>, #The name of the requesting agent.
+                'taskID': <unique task ID>, #The task ID for the canceled Task.
+            }
+
+        requesterID
+            The name of the requesting agent.
+        taskID
+            The desired task ID for this task. It must be unique among all other scheduled tasks.
+        priority
+            The desired task priority, must be 'HIGH', 'LOW', or 'LOW_PREEMPT'
+
+        No message is requires to cancel a schedule.
+
+        """
+        if sender == 'pubsub.compat':
+            message = compat.unpack_legacy_message(headers, message)
+
+        request_type = headers.get('type')
+        _log.debug('handle_schedule_request: {topic}, {headers}, {message}'.
+                   format(topic=topic, headers=str(headers), message=str(message)))
+
+        requester_id = headers.get('requesterID')
+        task_id = headers.get('taskID')
+        priority = headers.get('priority')
+
+        if request_type == SCHEDULE_ACTION_NEW:
+            try:
+                if len(message) == 1:
+                    requests = message[0]
+                else:
+                    requests = message
+
+                self.request_new_schedule(requester_id, task_id, priority, requests)
+            except StandardError as ex:
+                return self._handle_unknown_schedule_error(ex, headers, message)
+
+        elif request_type == SCHEDULE_ACTION_CANCEL:
+            try:
+                self.request_cancel_schedule(requester_id, task_id)
+            except StandardError as ex:
+                return self._handle_unknown_schedule_error(ex, headers, message)
+        else:
+            _log.debug('handle-schedule_request, invalid request type')
+            self.vip.pubsub.publish('pubsub', topics.ACTUATOR_SCHEDULE_RESULT(), headers,
+                                    {'result': SCHEDULE_RESPONSE_FAILURE,
+                                     'data': {},
+                                     'info': 'INVALID_REQUEST_TYPE'})
+
     @RPC.export
     def get_point(self, topic, **kwargs):
         """
@@ -645,88 +752,6 @@ class MasterDriverAgent(Agent):
         else:
             raise LockError("caller does not have this lock")
 
-    def _check_lock(self, device, requester):
-        _log.debug('_check_lock: {device}, {requester}'.format(device=device,
-                                                              requester=requester))
-        device = device.strip('/')
-        if device in self._device_states:
-            device_state = self._device_states[device]
-            return device_state.agent_id == requester
-        return False
-
-    def handle_schedule_request(self, peer, sender, bus, topic, headers, message):
-        """
-        Schedule request pub/sub handler
-
-        An agent can request a task schedule by publishing to the
-        ``devices/actuators/schedule/request`` topic with the following header:
-
-        .. code-block:: python
-
-            {
-                'type': 'NEW_SCHEDULE',
-                'requesterID': <Agent ID>, #The name of the requesting agent.
-                'taskID': <unique task ID>, #The desired task ID for this task. It must be unique among all other scheduled tasks.
-                'priority': <task priority>, #The desired task priority, must be 'HIGH', 'LOW', or 'LOW_PREEMPT'
-            }
-
-        The message must describe the blocks of time using the format described in `Device Schedule`_.
-
-        A task may be canceled by publishing to the
-        ``devices/actuators/schedule/request`` topic with the following header:
-
-        .. code-block:: python
-
-            {
-                'type': 'CANCEL_SCHEDULE',
-                'requesterID': <Agent ID>, #The name of the requesting agent.
-                'taskID': <unique task ID>, #The task ID for the canceled Task.
-            }
-
-        requesterID
-            The name of the requesting agent.
-        taskID
-            The desired task ID for this task. It must be unique among all other scheduled tasks.
-        priority
-            The desired task priority, must be 'HIGH', 'LOW', or 'LOW_PREEMPT'
-
-        No message is requires to cancel a schedule.
-
-        """
-        if sender == 'pubsub.compat':
-            message = compat.unpack_legacy_message(headers, message)
-
-        request_type = headers.get('type')
-        _log.debug('handle_schedule_request: {topic}, {headers}, {message}'.
-                   format(topic=topic, headers=str(headers), message=str(message)))
-
-        requester_id = headers.get('requesterID')
-        task_id = headers.get('taskID')
-        priority = headers.get('priority')
-
-        if request_type == SCHEDULE_ACTION_NEW:
-            try:
-                if len(message) == 1:
-                    requests = message[0]
-                else:
-                    requests = message
-
-                self.request_new_schedule(requester_id, task_id, priority, requests)
-            except StandardError as ex:
-                return self._handle_unknown_schedule_error(ex, headers, message)
-
-        elif request_type == SCHEDULE_ACTION_CANCEL:
-            try:
-                self.request_cancel_schedule(requester_id, task_id)
-            except StandardError as ex:
-                return self._handle_unknown_schedule_error(ex, headers, message)
-        else:
-            _log.debug('handle-schedule_request, invalid request type')
-            self.vip.pubsub.publish('pubsub', topics.ACTUATOR_SCHEDULE_RESULT(), headers,
-                                    {'result': SCHEDULE_RESPONSE_FAILURE,
-                                     'data': {},
-                                     'info': 'INVALID_REQUEST_TYPE'})
-
     @RPC.export
     def request_new_schedule(self, requester_id, task_id, priority, requests):
         """
@@ -760,7 +785,9 @@ class MasterDriverAgent(Agent):
         try:
             if requests and isinstance(requests[0], basestring):
                 requests = [requests]
-            requests = [[r[0].strip('/'),utils.parse_timestamp_string(r[1]),utils.parse_timestamp_string(r[2])] for r in requests]
+            requests = [[r[0].strip('/'),
+                         utils.parse_timestamp_string(r[1]),
+                         utils.parse_timestamp_string(r[2])] for r in requests]
 
         except StandardError as ex:
             return self._handle_unknown_schedule_error(ex, headers, requests)
@@ -791,15 +818,6 @@ class MasterDriverAgent(Agent):
                    'info': result.info_string}
         self.vip.pubsub.publish('pubsub', topic, headers=headers, message=results)
 
-        return results
-
-    def _handle_unknown_schedule_error(self, ex, headers, message):
-        _log.error(
-            'bad request: {header}, {request}, {error}'.format(header=headers, request=message, error=str(ex)))
-        results = {'result': "FAILURE",
-                   'data': {},
-                   'info': 'MALFORMED_REQUEST: ' + ex.__class__.__name__ + ': ' + str(ex)}
-        self.vip.pubsub.publish('pubsub', topics.ACTUATOR_SCHEDULE_RESULT(), headers=headers, message=results)
         return results
 
     @RPC.export
@@ -840,23 +858,6 @@ class MasterDriverAgent(Agent):
             self._update_device_state_and_schedule(now)
 
         return message
-
-    def _get_headers(self, requester, time=None, task_id=None):
-        headers = {}
-        if time is not None:
-            headers['time'] = time
-        else:
-            utcnow = datetime.utcnow()
-            headers = {'time': utils.format_timestamp(utcnow)}
-        if requester is not None:
-            headers['requesterID'] = requester
-        if task_id is not None:
-            headers['taskID'] = task_id
-        return headers
-
-    def _push_result_topic_pair(self, prefix, point, headers, value):
-        topic = normtopic('/'.join([prefix, point]))
-        self.vip.pubsub.publish('pubsub', topic, headers, message=value)
 
 
 def main(argv=sys.argv):

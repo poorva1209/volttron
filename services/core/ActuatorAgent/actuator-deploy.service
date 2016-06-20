@@ -1,5 +1,0 @@
-{
-    "schedule_publish_interval": 30,
-    "heartbeat_period": 20,
-    "schedule_state_file": "actuator_state.pickle"
-}
