@@ -351,7 +351,7 @@ class SetPointDetector(Agent):
                 next_group = self.current_stpt_array[(1+grouper):(self.minimum_data_count+grouper+1)]
                 current_avg = self.current_stpt_array[(0+incrementer):(self.minimum_data_count+incrementer+index)]
                 _log.debug('Current {}'.format(current))
-                _log.debug('Next {}'.format(next_group))
+                _log.debug('NEXT {}'.format(next_group))
                 area = self.determine_distribution_area(current, next_group)
                 
                 _log.debug('distribution area {}'.format(area))
@@ -366,6 +366,7 @@ class SetPointDetector(Agent):
                                      self.timestamp_array[self.minimum_data_count+grouper+1],
                                      np.average(next_group)]
                         set_points.append(last_stpt)
+                    current = list(next_group)
                 else:
                     index += 1
                     if grouper == number_groups - 1:
@@ -375,7 +376,6 @@ class SetPointDetector(Agent):
                                     np.average(current_avg)]
                         set_points.append(current_stpt)
         _log.debug('SETPOINT ARRAY: {}'.format(set_points))
-        sys.exit()
         return set_points
     
     def determine_distribution_area(self, current_ts, next_ts):
@@ -403,6 +403,8 @@ class SetPointDetector(Agent):
         remove_temp1 = [(x[0], x[1]) for x, y in zip(peak_ts, valley_ts) if x[1] >= y[1] + 0.2]
         remove_temp2 = [(y[0], y[1]) for x, y in zip(peak_ts, valley_ts) if x[1] >= y[1] + 0.2]
 
+        remove_temp1 = [(x[0], x[1]) for x, y in zip(peak_ts, valley_ts) if x[1] < y[1] + 5.0]
+        remove_temp2 = [(y[0], y[1]) for x, y in zip(peak_ts, valley_ts) if x[1] < y[1] + 5.0]
         peak_temp = [row[1] for row in remove_temp1]
         valley_temp = [row[1] for row in remove_temp2]
         
