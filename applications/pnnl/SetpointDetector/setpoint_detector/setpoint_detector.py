@@ -346,20 +346,22 @@ class SetPointDetector(Agent):
             current_stpt = [self.timestamp_array[0], self.timestamp_array[-1], np.average(self.current_stpt_array)]
             set_points.append(current_stpt)
         else:
+            current = self.current_stpt_array[0:self.minimum_data_count]
             for grouper in range(number_groups):
-                current = self.current_stpt_array[(0+incrementer):(self.minimum_data_count+incrementer+index)]
                 next_group = self.current_stpt_array[(1+grouper):(self.minimum_data_count+grouper+1)]
+                current_avg = self.current_stpt_array[(0+incrementer):(self.minimum_data_count+incrementer+index)]
                 _log.debug('Current {}'.format(current))
-                _log.debug('Current {}'.format(next_group))
+                _log.debug('Next {}'.format(next_group))
                 area = self.determine_distribution_area(current, next_group)
+                
                 _log.debug('distribution area {}'.format(area))
                 if area < self.area_distribution_threshold:
                     incrementer += 1
                     current_stpt = [self.timestamp_array[0+incrementer],
                                     self.timestamp_array[self.minimum_data_count+incrementer+index],
-                                    np.average(current)]
+                                    np.average(current_avg)]
                     set_points.append(current_stpt)
-                    if grouper < number_groups- 1:
+                    if grouper < number_groups - 1:
                         last_stpt = [self.timestamp_array[1+grouper],
                                      self.timestamp_array[self.minimum_data_count+grouper+1],
                                      np.average(next_group)]
@@ -370,11 +372,10 @@ class SetPointDetector(Agent):
                         current = self.current_stpt_array[(0+incrementer):(self.minimum_data_count+grouper+1)]
                         current_stpt = [self.timestamp_array[0+incrementer],
                                     self.timestamp_array[self.minimum_data_count+grouper+1],
-                                    np.average(current)]
+                                    np.average(current_avg)]
                         set_points.append(current_stpt)
         _log.debug('SETPOINT ARRAY: {}'.format(set_points))
-        if self.debug:
-            plt.close()
+        sys.exit()
         return set_points
     
     def determine_distribution_area(self, current_ts, next_ts):
