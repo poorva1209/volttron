@@ -503,7 +503,7 @@ def driven_agent(config_path, **kwargs):
             else:
                 #for device, point_value_dict in results.devices.items():
                     #make_actuator_set(device, point_value_dict)
-                if result.devices:
+                if results.devices:
                     make_actuator_set_multiple(results.devices)
                 for device in command_devices:
                     make_actuator_set(device, results.commands)
