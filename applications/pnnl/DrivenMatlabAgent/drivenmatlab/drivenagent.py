@@ -109,6 +109,7 @@ def driven_agent(config_path, **kwargs):
     device_topic_list = []
     subdevices_list = []
     vip_destination = config.get('vip_destination', None)
+    use_route = config.get('use_route', False)
     from_file = config.get('from_file')
     for device_name in device_config:
         device_topic = topics.DEVICES_VALUE(campus=campus_building.get('campus'),
@@ -454,11 +455,11 @@ def driven_agent(config_path, **kwargs):
         def actuator_set(self, results):
             """
             Calls the actuator's set_point method to set point on device
-
+ 
             :param results: Results object containing commands for devices,
                     log messages and table data.
             :type results: Results object \\volttron.platform.agent.driven"""
-
+ 
             def make_actuator_set(device, point_value_dict):
                 for point, new_value in point_value_dict.items():
                     point_path = base_actuator_path(unit=device, point=point)
@@ -470,12 +471,42 @@ def driven_agent(config_path, **kwargs):
                     except RemoteError as ex:
                         _log.warning("Failed to set {} to {}: {}".format(point_path, new_value, str(ex)))
                         continue
+            
+            def make_actuator_set_multiple(result_devices):
+                topics_values = []
+                for device, point_value_dict in result_devices.items():
+                    for point, new_value in point_value_dict.items():
+                        point_path = base_actuator_path(unit=device, point=point)
+                        topics_values.append((str(point_path), new_value))
+                try:
+                    _log.info('Set multiple points {} '.format(topics_values))
+                    result = self.actuation_vip.call('platform.actuator', 'set_multiple_points',
+                                                     actuator_id, topics_values).get(timeout=15)
+                except RemoteError as ex:
+                    _log.warning("Failed to set {} to {}: {}".format(point_path, new_value, str(ex)))
+            
+            def make_route(result_devices):
+                topics_values = []
+                for device, point_value_dict in result_devices.items():
+                    for point, new_value in point_value_dict.items():
+                        point_path = base_actuator_path(unit=device, point=point)
+                        topics_values.append((str(point_path), new_value))
+                try:
+                    _log.info('Routing multiple points {} '.format(topics_values))
+                    result = self.actuation_vip.call('platform.actuator', 'route',
+                                                     actuator_id, topics_values).get(timeout=15)
+                except RemoteError as ex:
+                    _log.warning("Failed to set {} to {}: {}".format(point_path, new_value, str(ex)))
 
-            for device, point_value_dict in results.devices.items():
-                make_actuator_set(device, point_value_dict)
-
-            for device in command_devices:
-                make_actuator_set(device, results.commands)
+            if use_route:
+                make_route(results.devices)
+            else:
+                #for device, point_value_dict in results.devices.items():
+                    #make_actuator_set(device, point_value_dict)
+                if result.devices:
+                    make_actuator_set_multiple(results.devices)
+                for device in command_devices:
+                    make_actuator_set(device, results.commands)
             return results
 
     DrivenAgent.__name__ = 'DrivenLoggerAgent'
